@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Gesture Controlled 3D Particles</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    #info {
+      position: fixed; top: 10px; left: 10px; max-width: 360px;
+      color: #fff; font-family: system-ui, Arial;
+      background: rgba(0,0,0,0.5); padding: 12px 14px; border-radius: 10px; line-height: 1.5;
+    }
+    #info b { color: #fff; }
+    #video { position: fixed; right: 10px; bottom: 10px; width: 240px; border-radius: 8px; opacity: 0.25; }
+  </style>
+</head>
+<body>
+<div id="info">
+  <div><b>✋ Expansion:</b> Thumb–index distance → particle spread & size</div>
+  <div><b>🟧 Color:</b> Vertical index motion (up/down) → hue shift</div>
+  <div><b>🔀 Templates:</b>
+    <ul style="margin:6px 0 0 16px;">
+      <li>✌ Peace (2 fingers) → Heart</li>
+      <li>🤟 Three fingers → Flower</li>
+      <li>🖖 Four fingers → Saturn</li>
+      <li>🖐 Five fingers → Fireworks</li>
+      <li>👊 Fist / else → Sphere</li>
+    </ul>
+  </div>
+</div>
+<video id="video" playsinline></video>
+
+<!-- Three.js -->
+<script src="https://cdn.jsdelivr.net/npm/three@0.155.0/build/three.min.js"></script>
+<!-- MediaPipe Hands & camera utils -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+<script>
+/* ======================
+   THREE.JS SCENE SETUP
+====================== */
+const scene = new THREE.Scene();
+const camera3D = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+camera3D.position.z = 90;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+window.addEventListener('resize', () => {
+  camera3D.aspect = window.innerWidth / window.innerHeight;
+  camera3D.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+/* ======================
+   PARTICLE SYSTEM
+====================== */
+const PARTICLE_COUNT = 12000;
+let particles, geometry, material, basePositions, velocities;
+let currentTemplate = 'sphere';
+let fireworksMode = false;
+let time = 0;
+
+// Controls from gestures (smoothed)
+let expansion = 0.5;   // 0..1
+let hueControl = 0.5;  // 0..1
+
+// Smoothing helpers (EMA)
+function smooth(value, prev, alpha = 0.15) { return prev + alpha * (value - prev); }
+
+function createParticles(template = 'sphere') {
+  if (particles) {
+    scene.remove(particles);
+    particles.geometry.dispose();
+    particles.material.dispose();
+  }
+
+  geometry = new THREE.BufferGeometry();
+  const positions = new Float32Array(PARTICLE_COUNT * 3);
+  basePositions = new Float32Array(PARTICLE_COUNT * 3);
+  velocities = new Float32Array(PARTICLE_COUNT); // radial speed for fireworks
+
+  // Fill positions according to template
+  fillTemplatePositions(template, basePositions);
+
+  // Copy into working positions
+  for (let i = 0; i < PARTICLE_COUNT * 3; i++) positions[i] = basePositions[i];
+
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('basePosition', new THREE.BufferAttribute(basePositions, 3)); // optional reference
+  material = new THREE.PointsMaterial({
+    color: 0xffffff,
+    size: 0.5,
+    transparent: true,
+    opacity: 0.95,
+    depthWrite: false
+  });
+
+  particles = new THREE.Points(geometry, material);
+  scene.add(particles);
+
+  fireworksMode = (template === 'fireworks');
+}
+
+function randomRange(min, max) { return min + Math.random() * (max - min); }
+
+function fillTemplatePositions(template, arr) {
+  const N = PARTICLE_COUNT;
+
+  if (template === 'heart') {
+    for (let i = 0; i < N; i++) {
+      const t = Math.random() * Math.PI * 2;
+      const x = 16 * Math.pow(Math.sin(t), 3);
+      const y = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+      const z = (Math.random() - 0.5) * 6;
+      arr[i*3] = x * 0.8;
+      arr[i*3+1] = y * 0.8;
+      arr[i*3+2] = z;
+    }
+  } else if (template === 'flower') {
+    // Polar "rose": r = a * cos(k * theta)
+    const a = 22, k = 5;
+    for (let i = 0; i < N; i++) {
+      const theta = Math.random() * Math.PI * 2;
+      const r = a * Math.cos(k * theta) + randomRange(-1.5, 1.5);
+      const x = r * Math.cos(theta);
+      const y = r * Math.sin(theta);
+      const z = (Math.random() - 0.5) * 8;
+      arr[i*3] = x;
+      arr[i*3+1] = y;
+      arr[i*3+2] = z;
+    }
+  } else if (template === 'saturn') {
+    // Mix sphere body and ring (torus-like)
+    const sphereFraction = 0.6;
+    const ringRadius = 26, ringTubeJitter = 2.8;
+    const bodyRadius = 16;
+
+    for (let i = 0; i < N; i++) {
+      const f = Math.random();
+      if (f < sphereFraction) {
+        // sphere points
+        const u = Math.random();
+        const v = Math.random();
+        const theta = 2 * Math.PI * u;
+        const phi = Math.acos(2 * v - 1);
+        const r = bodyRadius + randomRange(-1.0, 1.0);
+        const x = r * Math.sin(phi) * Math.cos(theta);
+        const y = r * Math.sin(phi) * Math.sin(theta);
+        const z = r * Math.cos(phi);
+        arr[i*3] = x; arr[i*3+1] = y; arr[i*3+2] = z;
+      } else {
+        // ring points around XY plane
+        const theta = Math.random() * 2 * Math.PI;
+        const tube = (Math.random() - 0.5) * ringTubeJitter;
+        const x = (ringRadius + tube) * Math.cos(theta);
+        const y = (ringRadius + tube) * Math.sin(theta);
+        const z = tube * 0.4;
+        arr[i*3] = x; arr[i*3+1] = y; arr[i*3+2] = z;
+      }
+    }
+  } else if (template === 'fireworks') {
+    // Base directions with small jitter; animation will expand/contract
+    for (let i = 0; i < N; i++) {
+      const u = Math.random();
+      const v = Math.random();
+      const theta = 2 * Math.PI * u;
+      const phi = Math.acos(2 * v - 1);
+      const dir = 1.0;
+      const x = dir * Math.sin(phi) * Math.cos(theta);
+      const y = dir * Math.sin(phi) * Math.sin(theta);
+      const z = dir * Math.cos(phi);
+      arr[i*3] = x; arr[i*3+1] = y; arr[i*3+2] = z;
+      velocities[i] = randomRange(10, 24); // radial speed scalar
+    }
+  } else {
+    // sphere (default)
+    for (let i = 0; i < N; i++) {
+      const u = Math.random();
+      const v = Math.random();
+      const theta = 2 * Math.PI * u;
+      const phi = Math.acos(2 * v - 1);
+      const r = 20 + randomRange(-1.5, 1.5);
+      const x = r * Math.sin(phi) * Math.cos(theta);
+      const y = r * Math.sin(phi) * Math.sin(theta);
+      const z = r * Math.cos(phi);
+      arr[i*3] = x; arr[i*3+1] = y; arr[i*3+2] = z;
+    }
+  }
+}
+
+createParticles('sphere');
+
+/* ======================
+   HAND TRACKING
+====================== */
+const videoEl = document.getElementById('video');
+
+const hands = new Hands({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+});
+hands.setOptions({
+  maxNumHands: 1,
+  modelComplexity: 1,
+  minDetectionConfidence: 0.6,
+  minTrackingConfidence: 0.6
+});
+hands.onResults(onResults);
+
+const mpCamera = new Camera(videoEl, {
+  onFrame: async () => { await hands.send({ image: videoEl }); },
+  width: 640, height: 480
+});
+mpCamera.start();
+
+/* ======================
+   GESTURE CONTROL LOGIC
+====================== */
+function isFingerExtended(lm, tipIdx, pipIdx) {
+  // tip.y < pip.y means finger pointing up (camera space, y grows downward)
+  return lm[tipIdx].y < lm[pipIdx].y;
+}
+
+// Count extended fingers: index(8>6), middle(12>10), ring(16>14), pinky(20>18)
+// Thumb is tricky; skip for template selection
+function countExtended(lm) {
+  let count = 0;
+  count += isFingerExtended(lm, 8, 6) ? 1 : 0;
+  count += isFingerExtended(lm, 12, 10) ? 1 : 0;
+  count += isFingerExtended(lm, 16, 14) ? 1 : 0;
+  count += isFingerExtended(lm, 20, 18) ? 1 : 0;
+  return count;
+}
+
+function onResults(results) {
+  if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) return;
+
+  const lm = results.multiHandLandmarks[0];
+
+  // Expansion: thumb tip (4) to index tip (8) distance
+  const dx = lm[4].x - lm[8].x;
+  const dy = lm[4].y - lm[8].y;
+  const dist = Math.sqrt(dx*dx + dy*dy); // ~0..0.2
+  const targetExpansion = THREE.MathUtils.clamp((dist - 0.02) / 0.18, 0, 1);
+  expansion = smooth(targetExpansion, expansion, 0.2);
+
+  // Color via vertical index movement (invert so moving up → warmer)
+  const targetHue = THREE.MathUtils.clamp(1.0 - lm[8].y, 0, 1);
+  hueControl = smooth(targetHue, hueControl, 0.15);
+
+  // Template switching based on number of extended fingers
+  const count = countExtended(lm);
+  let desired = 'sphere';
+  if (count === 2) desired = 'heart';
+  else if (count === 3) desired = 'flower';
+  else if (count === 4) desired = 'saturn';
+  else if (count >= 5) desired = 'fireworks';
+
+  if (desired !== currentTemplate) {
+    currentTemplate = desired;
+    createParticles(currentTemplate);
+  }
+}
+
+/* ======================
+   ANIMATION LOOP
+====================== */
+function animate() {
+  requestAnimationFrame(animate);
+  time += 0.016;
+
+  // Update material color and size from hue/expansion
+  const hue = hueControl; // 0..1
+  const sat = 1.0;
+  const light = 0.55;
+  material.color.setHSL(hue, sat, light);
+  material.size = 0.4 + expansion * 1.2;
+
+  const pos = geometry.attributes.position.array;
+  const base = geometry.attributes.basePosition.array;
+
+  if (fireworksMode) {
+    // Expand/contract bursts with slight twinkle
+    const N = PARTICLE_COUNT;
+    const baseRadius = 6 + expansion * 40;  // hand distance drives burst radius
+    const twinkle = 0.6 + Math.sin(time * 6.0) * 0.4;
+
+    for (let i = 0; i < N; i++) {
+      const dirX = base[i*3];
+      const dirY = base[i*3+1];
+      const dirZ = base[i*3+2];
+
+      // Normalize direction
+      const len = Math.max(Math.sqrt(dirX*dirX + dirY*dirY + dirZ*dirZ), 1e-6);
+      const nx = dirX / len, ny = dirY / len, nz = dirZ / len;
+
+      // Radial travel with gentle pulsation
+      const r = baseRadius + Math.sin(time * 2.0 + i * 0.001) * 4.0;
+      pos[i*3]   = nx * r;
+      pos[i*3+1] = ny * r;
+      pos[i*3+2] = nz * r;
+
+      // Vary per-particle opacity slightly via size jitter
+      material.size = 0.4 + expansion * 1.2 * twinkle;
+    }
+  } else {
+    // Non-fireworks: expand by scaling away from origin with slight breathing
+    const N3 = PARTICLE_COUNT * 3;
+    const scale = 1.0 + expansion * 1.5 + Math.sin(time * 0.8) * 0.05;
+    for (let i = 0; i < N3; i += 3) {
+      pos[i]   = base[i]   * scale;
+      pos[i+1] = base[i+1] * scale;
+      pos[i+2] = base[i+2] * scale;
+    }
+  }
+
+  geometry.attributes.position.needsUpdate = true;
+
+  // Gentle rotation for depth
+  particles.rotation.y += 0.0025;
+  particles.rotation.x += 0.0015;
+
+  renderer.render(scene, camera3D);
+}
+animate();
+</script>
+</body>
+</html>
